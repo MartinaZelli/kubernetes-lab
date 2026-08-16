@@ -1,0 +1,32 @@
+variable "libvirt_uri" {
+  description = "Libvirt URI to connect to the hypervisor"
+  type        = string
+  default     = "qemu:///system"
+}
+variable "storage_pool" {
+  type        = string
+  default     = "default"
+  description = "Name of the libvirt storage pool"
+}
+
+variable "ubuntu_image_url" {
+  type        = string
+  default     = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+  description = "URL of the Ubuntu cloud image to fetch as the base volume"
+}
+
+variable "dns1" {
+  type    = string
+  default = "1.1.1.1"
+}
+
+variable "dns2" {
+  type    = string
+  default = "8.8.8.8"
+}
+
+variable "ssh_public_key_path" {
+  type        = string
+  description = "Percorso locale della chiave SSH pubblica"
+  default     = "~/.ssh/id_k8slab.pub"
+}

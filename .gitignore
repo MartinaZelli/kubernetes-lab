@@ -1,0 +1,16 @@
+# --- OpenTofu / Terraform ---
+*.tfvars
+*.tfstate*
+*.tfplan
+*.terraform*
+!.terraform.lock.hcl
+
+# --- Kubernetes ---
+# kubeconfig: contiene le credenziali di amministratore del cluster
+kubeconfig
+*.kubeconfig
+k3s.yaml
+
+# --- segreti ---
+*.key
+*.pem
