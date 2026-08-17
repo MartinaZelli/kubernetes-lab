@@ -14,3 +14,7 @@ k3s.yaml
 # --- segreti ---
 *.key
 *.pem
+
+# Kubernetes: secret con valori reali
+manifests/*-secret.yaml
+!manifests/*-secret.example.yaml
