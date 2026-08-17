@@ -1,0 +1,12 @@
+[Unit]
+Description=Regole firewall per la rete NAT del lab Kubernetes
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/k8s-lab-firewall.sh
+
+[Install]
+WantedBy=multi-user.target

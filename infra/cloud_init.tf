@@ -17,14 +17,17 @@ resource "libvirt_cloudinit_disk" "vm_init" {
         shell: /bin/bash
         sudo: ['ALL=(ALL) NOPASSWD:ALL']
         ssh_authorized_keys:
-          - ${file(var.ssh_public_key_path)}
+          - ${trimspace(file(var.ssh_public_key_path))}
     write_files:
       - path: /etc/apt/preferences.d/no-snapd
         content: |
           Package: snapd
           Pin: release a=*
           Pin-Priority: -10
-    - path: /etc/hosts
+      - path: /etc/apt/apt.conf.d/99force-ipv4
+        content: |
+          Acquire::ForceIPv4 "true";
+      - path: /etc/hosts
         content: |
           127.0.0.1   localhost
           ${join("\n      ", local.hosts_entries)}
@@ -61,5 +64,6 @@ resource "libvirt_cloudinit_disk" "vm_init" {
           search: ${jsonencode(each.value.search)}
         dhcp4: false
         dhcp6: false
+        accept-ra: false
   EOF
 }
