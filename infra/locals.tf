@@ -44,7 +44,11 @@ locals {
     )
   }
 
-  # righe di /etc/hosts: OGNI nodo deve conoscere gli altri due
+  # righe di /etc/hosts: ogni nodo deve conoscere gli altri due.
+  # NB: nel join in cloud_init.tf il separatore ha 6 spazi di indentazione.
+  # Quel valore NON subisce la rimozione di <<-EOF (che invece toglie 4 spazi
+  # alle righe letterali), quindi va scritto già come deve risultare nel file.
+  # Se lo cambi, verifica con: tofu plan | grep -A6 "path: /etc/hosts"
   hosts_entries = [
     for vm in local.vms : "${vm.ip}   ${vm.hostname}.${vm.domain}   ${vm.hostname}"
   ]

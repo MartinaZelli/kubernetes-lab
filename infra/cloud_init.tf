@@ -24,10 +24,10 @@ resource "libvirt_cloudinit_disk" "vm_init" {
           Package: snapd
           Pin: release a=*
           Pin-Priority: -10
-      - path: /etc/hosts
+    - path: /etc/hosts
         content: |
           127.0.0.1   localhost
-          ${join("\n          ", local.hosts_entries)}
+          ${join("\n      ", local.hosts_entries)}
           ::1 ip6-localhost ip6-loopback
           fe00::0 ip6-localnet
           ff00::0 ip6-mcastprefix
