@@ -1,0 +1,45 @@
+# La struttura a matrioska. Questo è il punto che confonde tutti all'inizio. Ci sono due blocchi metadata e due blocchi spec: quelli esterni descrivono lo StatefulSet, quelli dentro template descrivono i pod che deve creare. Il template è uno stampo, non un oggetto.
+apiVersion: apps/v1 # apps/v1 e non v1: StatefulSet e Deployment stanno nel gruppo API apps, non nel core.
+kind: StatefulSet
+metadata:
+  name: mysql
+  namespace: db
+  labels:
+    progetto: menu
+spec:
+  serviceName: mysql
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql #deve combacire con le label dei pod che crea, altrimenti non li gestisce
+  template:
+    metadata:
+      labels:
+        app: mysql #deve combacire con le label del selector, altrimenti non li gestisce
+        progetto: menu
+    spec:
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          ports:
+            - name: mysql
+              containerPort: 3306
+          envFrom:
+            - secretRef:
+                name: mysql-credentials
+                # envFrom con secretRef è la traduzione diretta del tuo blocco Ansible: prende tutte le chiavi del Secret e le inietta come variabili d'ambiente. MYSQL_ROOT_PASSWORD, MYSQL_DATABASE, MYSQL_USER, MYSQL_PASSWORD arrivano nel container esattamente come le passavi a Docker.
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              #resources non c'era nel tuo Docker. requests è quello che lo scheduler garantisce: cerca un nodo con almeno 512Mi liberi. limits è il tetto: se il container supera 1Gi di memoria viene ucciso. Il 250m significa 250 millicore, cioè un quarto di CPU. Ho messo un limite di memoria ma non di CPU di proposito: superare il limite di memoria uccide il processo, superare quello di CPU lo rallenta soltanto — e un database rallentato è meglio di un database morto.
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: mysql-data
+            #volumeMounts + volumes sono due metà della stessa cosa, e la separazione confonde. volumes (a livello di pod) dice quale storage usare — qui il PVC di prima. volumeMounts (a livello di container) dice dove montarlo dentro quel container. Il campo name: data è la chiave che li lega. /var/lib/mysql è dove MySQL tiene i dati, identico al tuo Ansible.

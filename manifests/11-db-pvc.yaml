@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-data
+  namespace: db
+  labels:
+    progetto: menu
+spec:
+  accessModes:
+    - ReadWriteOnce # montabile in lettura e scrittura da un solo nodo alla volta (unico possibile per un volume locale)
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 5Gi #obbligatorio da segnare ma inutile per i volumi locali, che non hanno limiti di spazio se non la macchina stessa

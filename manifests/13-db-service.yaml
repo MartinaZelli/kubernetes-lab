@@ -1,0 +1,17 @@
+# Perché serve. Il pod ha IP 10.42.1.3, ma se muore e viene ricreato ne prende un altro. Il webserver non può avere un indirizzo cablato che cambia. Il Service è un IP e un nome stabili davanti a pod effimeri.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: db
+  labels:
+    progetto: menu
+spec:
+  type: ClusterIP # type: ClusterIP è il tipo predefinito: raggiungibile solo dall'interno del cluster. Giusto per un database — non vuoi esporre MySQL fuori. Il NodePort lo useremo per il web.
+  selector:
+    app: mysql
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: 3306
+      # port e targetPort sono distinti di proposito: port è quella su cui il Service ascolta, targetPort quella del container. Qui coincidono, ma potresti esporre sulla 3306 un container che ascolta sulla 3307.
