@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: web
+  labels:
+    progetto: menu
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+        progetto: menu
+    spec:
+      affinity:
+        podAntiAffinity:
+          # ── ATTIVA ── vincolo DURO: se non è soddisfabile il pod resta Pending.
+          # Il labelSelector dell'anti-affinity punta ai pod stessi. Leggilo così: "non schedulare questo pod su un nodo che ospita già un pod con app: web". Siccome i pod di questo Deployment hanno proprio quell'etichetta, la regola li respinge a vicenda
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: web
+              topologyKey: kubernetes.io/hostname
+
+          # ── ALTERNATIVA 1 ── preferenza: ci prova, ma se non riesce schedula comunque.
+          # Nota la struttura DIVERSA: serve il wrapper podAffinityTerm e un weight 1-100.
+          # preferredDuringSchedulingIgnoredDuringExecution:
+          #   - weight: 100 # il peso serve perché con più preferenze lo scheduler somma i punteggi e scegli tu quale conta di più
+          #     podAffinityTerm:
+          #       labelSelector:
+          #         matchLabels:
+          #           app: web
+          #       topologyKey: kubernetes.io/hostname
+
+      # ── ALTERNATIVA 2 ── topologySpreadConstraints: distribuzione uniforme.
+      # ATTENZIONE: sta a livello di spec del POD, NON sotto affinity.
+      # maxSkew 1 = differenza massima di pod tra due nodi.
+      # Scala meglio: con 10 repliche su 3 nodi accetta 4-3-3, mentre
+      # l'anti-affinity dura fallirebbe (non esistono 10 nodi diversi).
+      # topologySpreadConstraints:
+      #   - maxSkew: 1
+      #     topologyKey: kubernetes.io/hostname
+      #     whenUnsatisfiable: DoNotSchedule
+      #     labelSelector:
+      #       matchLabels:
+      #         app: web
+
+      containers:
+        - name: nginx
+          image: nginx:1.27-alpine
+          ports:
+            - name: http
+              containerPort: 80
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"

@@ -12,6 +12,6 @@ spec:
     app: mysql
   ports:
     - name: mysql
-      port: 3306
+      port: 3306 # porta del Service all'interno del cluster: altri pod useranno mysql:3306
       targetPort: 3306
       # port e targetPort sono distinti di proposito: port è quella su cui il Service ascolta, targetPort quella del container. Qui coincidono, ma potresti esporre sulla 3306 un container che ascolta sulla 3307.
