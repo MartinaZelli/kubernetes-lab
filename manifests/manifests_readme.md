@@ -568,21 +568,129 @@ k api-resources | grep -i statefulset    # colonna APIVERSION
 
 ---
 
+## Il `Job` di inizializzazione
+
+`main.py` **non chiama mai** `init_db()`: le tabelle le crea `popola_db.py`, che
+nel `docker-compose` originale era un secondo servizio. Senza, l'app parte e
+fallisce alla prima query.
+
+In Kubernetes questo è un **`Job`**: un pod che gira una volta, fa il suo lavoro
+e termina. È l'oggetto pensato per migrazioni di database e task di
+inizializzazione.
+
+| Campo | Perché |
+|---|---|
+| `apiVersion: batch/v1` | i Job stanno nel gruppo `batch`, non `apps` né core |
+| `restartPolicy: OnFailure` | obbligatorio: `Always` non è ammesso nei Job, sarebbe una contraddizione |
+| `backoffLimit: 3` | dopo tre fallimenti smette; senza, riproverebbe all'infinito |
+| `ttlSecondsAfterFinished: 3600` | Job e pod si autocancellano dopo un'ora; senza, restano a sporcare `get pods` |
+| `command: ["python3","popola_db/popola_db.py"]` | sovrascrive il `CMD` del Dockerfile: **stessa immagine, comando diverso** |
+| `PYTHONPATH: /app` | lo script gira da `/app/popola_db/` ma importa `from src.database import …` |
+
+Un'immagine è un **ambiente di esecuzione**, non un programma: contiene tutto il
+necessario e il comando si sceglie all'avvio. Per questo app e Job condividono la
+stessa immagine.
+
+**Un Job è in gran parte immutabile.** `kubectl apply` su uno esistente con
+modifiche fallisce. Per rieseguirlo:
+
+```bash
+kubectl delete job db-init -n web
+kubectl apply -f manifests/15-app-db-init-job.yaml
+kubectl logs -n web job/db-init --follow
+```
+
+⚠️ `popola_db.py` cattura le eccezioni e **non esce con codice non-zero**: un
+Job può risultare `Completed` anche se il popolamento è fallito. Leggere sempre
+i log e cercare `Sincronizzazione database completata.`
+
+⚠️ Rieseguirlo **svuota `pasti_salvati`**: cancella lo storico dei menù.
+
+## L'immagine dell'applicazione
+
+Kubernetes **non costruisce immagini**. È un orchestratore: sa avviare un
+container su un nodo, ma l'immagine deve già esistere ed essere scaricabile. Non
+c'è nessun passo di build — differenza sostanziale rispetto ad Ansible con
+`community.docker`, che poteva costruire sul posto.
+
+L'immagine sta su GHCR ed è **pubblica**, quindi i nodi la scaricano senza
+credenziali. Se fosse privata servirebbe un Secret di tipo `docker-registry`
+referenziato con `imagePullSecrets`.
+
+Isolare un problema di registry da un problema di manifest:
+
+```bash
+ssh k8s-w1 'sudo k3s crictl pull ghcr.io/martinazelli/menu:v2 && echo SCARICATA'
+```
+
+`crictl` è il client del runtime dei container, l'equivalente di `docker` per
+containerd. Se il pull funziona qui, eventuali errori successivi sono nello YAML.
+
+**Tag versionati, mai `latest`.** Con `latest` non si sa quale codice gira, e
+soprattutto il manifest non cambia — quindi Kubernetes non si accorge di niente
+e non fa il rollout. Con `v1`, `v2`, `v3` il manifest cambia e l'aggiornamento
+parte da sé.
+
+## Aggiornare la versione: il rolling update
+
+```bash
+sed -i 's|menu:v1|menu:v2|' manifests/20-web-deployment.yaml
+kubectl apply -f manifests/20-web-deployment.yaml
+kubectl rollout status deployment/web -n web
+```
+
+Cambiando l'immagine, il Deployment crea un **nuovo ReplicaSet** e riduce
+gradualmente il vecchio, mantenendo il servizio disponibile. Con l'anti-affinity
+dura procede un pod alla volta: il pod nuovo deve trovare un nodo libero da altri
+pod `app: web`.
+
+`kubectl rollout status` resta agganciato fino al completamento — meglio di un
+`get pods` ripetuto a mano.
+
+I vecchi ReplicaSet restano per permettere il rollback:
+
+```bash
+kubectl rollout history deployment/web -n web
+kubectl rollout undo deployment/web -n web
+```
+
+Sapere quale commit gira davvero:
+
+```bash
+kubectl get pods -n web -o custom-columns=\
+NOME:.metadata.name,NODO:.spec.nodeName,IMMAGINE:.spec.containers[0].image
+docker inspect ghcr.io/martinazelli/menu:v2 \
+  --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'
+```
+
+Un Job già completato **non** viene aggiornato dal rollout: è un fatto storico.
+Il tag nel suo manifest va allineato a mano per le esecuzioni future.
+
+## Porte: `port` e `targetPort` ora differiscono
+
+Con app menu erano entrambe `80`. Con uvicorn il container ascolta sulla **8000**,
+mentre il Service resta sulla `80`:
+
+```yaml
+port: 80          # il Service dentro il cluster
+targetPort: 8000  # la porta del container (uvicorn)
+nodePort: 30080   # la porta aperta su OGNI nodo
+```
+
+È il caso che rende evidente perché i tre campi sono distinti.
+
+---
+
 # Da fare
 
-- [ ] **Sostituire nginx con l'applicazione reale** (`ghcr.io/martinazelli/menu:v1`)
-- [ ] **`Job` di inizializzazione del database.** `main.py` non chiama mai
-  `init_db()`: le tabelle le crea `popola_db.py`, che nel `docker-compose`
-  originale era un secondo servizio. In Kubernetes è un `Job` — stessa immagine,
-  comando sovrascritto a `python3 popola_db/popola_db.py`, con `PYTHONPATH=/app`
 - [ ] **Sonde di salute.** L'app non ha un endpoint `/health` (il suo README lo
   segnala come "da implementare"): usare `/menu/elenco-piatti` o la radice
-  statica
-- [ ] Valutare `initContainer` che attende MySQL, invece di lasciare l'app in
+  statica. Senza `readinessProbe`, durante un rollout il Service manda traffico
+  a un pod che non ha ancora finito di avviarsi
+- [ ] Valutare un `initContainer` che attende MySQL, invece di lasciare l'app in
   crash loop al primo avvio
-- [ ] Rimuovere `10-db-secret.yaml` / `.example.yaml`, ora che
-  `gen-secrets.sh` gestisce lo stesso oggetto: due sorgenti per la stessa cosa
-  sono un rischio
+- [ ] Rimuovere `10-db-secret.yaml` / `.example.yaml`, ora che `gen-secrets.sh`
+  gestisce lo stesso oggetto: due sorgenti per la stessa cosa sono un rischio
 - [ ] `NetworkPolicy` per limitare l'accesso a MySQL solo dai pod di `web`
   (richiede un CNI che le supporti — Flannel di k3s **non** le applica)
 - [ ] Provare gli stessi manifest sul cluster kubeadm: dovrebbero funzionare
