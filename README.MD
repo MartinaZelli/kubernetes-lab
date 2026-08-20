@@ -128,55 +128,78 @@ registra la versione esatta del provider e i suoi checksum.
 
 ---
 
-# Le lezioni trasferibili
+# Decisioni tecniche
 
-Le trappole specifiche stanno nei README di ciascuna cartella. Qui i principi
-che valgono oltre questo progetto.
+## Rete NAT invece di bridge per le VM
 
-**Il codice descrive un livello, non tutti.** OpenTofu descrive le VM, non
-l'hypervisor che le ospita. Ogni livello ha presupposti impliciti sul livello
-sotto: renderli espliciti (`scripts/`) è metà del lavoro.
+Un bridge metterebbe le VM sulla LAN di casa, ma resta appeso all'interfaccia
+fisica: su un portatile, staccare il cavo significa nodi che non si vedono più e
+control plane che li marca `NotReady`.
 
-**Un `plan` verde non garantisce un `apply` riuscito.** Gli strumenti
-dichiarativi validano la coerenza *interna*; l'esistenza delle risorse esterne la
-scoprono solo al momento di agire.
+La rete NAT vive dentro l'host: il cluster regge anche offline. In cambio le VM
+non sono raggiungibili dal resto della LAN — irrilevante qui, perché sia
+`kubectl` sia il NodePort si usano dall'host.
 
-**Lo stato dichiarato non è lo stato di ciò che gira dentro.** OpenTofu garantisce
-che le risorse corrispondano alla descrizione, non che il sistema dentro le VM sia
-come lo immagini. Cloud-init legge la sua configurazione **solo al primo avvio**:
-cambiarla richiede ricreare la macchina.
+## Tre nodi invece di due
 
-**`apply` rimuove ciò che non è dichiarato.** Non aggiunge soltanto: allinea. È
-ciò che rende affidabile l'infrastruttura come codice, ed è il motivo per cui
-mescolare comandi imperativi e file dichiarativi sullo stesso oggetto porta guai.
+`kubeadm` applica al control plane la taint
+`node-role.kubernetes.io/control-plane:NoSchedule`. Con due VM resterebbe **un
+solo nodo schedulabile**, e il requisito "due pod su nodi diversi" sarebbe
+complesso da soddisfare.
 
-**Quando la documentazione non torna, chiedere allo strumento.** Il provider
-libvirt 0.9 è una riscrittura completa e quasi tutti gli esempi online descrivono
-lo schema vecchio. `tofu providers schema -json | jq` è la verità per la versione
-installata.
+Su k3s il nodo server è schedulabile e due basterebbero, ma la stessa
+infrastruttura deve servire entrambe le fasi.
 
-**Guardare l'artefatto, non il template.** Tre tentativi persi a ragionare
-sull'aritmetica dell'indentazione di un heredoc; il problema si è risolto
-leggendo il file *come è arrivato dentro la VM*
-(`/var/lib/cloud/instance/user-data.txt`).
+## Anti-affinity dura invece di `preferred`
 
-**`grep -A N` è pericoloso per il debug di indentazione**: taglia via le righe
-*sopra*, e in un caso reale la riga rotta era proprio quella. Usare
-`sed -n '/inizio/,/fine/p'`.
+Il requisito chiede la *certezza*, non una preferenza. Con
+`requiredDuringSchedulingIgnoredDuringExecution` un pod che non trova un nodo
+libero resta `Pending` invece di essere ammassato su uno già occupato.
 
-**I comandi interattivi non si incollano in blocco.** L'input in coda non va
-perso quando un programma prende il terminale: viene eseguito appena la shell
-riprende il controllo. Così è stato installato per sbaglio un server k3s
-sull'host.
+Verificato anche nel fallimento: portando le repliche a 4 su 3 nodi, il quarto
+pod resta in attesa e lo scheduler dichiara
+`0/3 nodes are available: 3 node(s) didn't match pod anti-affinity rules`.
 
-**Gli alias non esistono nelle shell non interattive.** `ssh host 'k get nodes'`
-fallisce: bash non legge `~/.bashrc`. Negli script si usano sempre i nomi
-completi.
+`topologySpreadConstraints` sarebbe la scelta migliore con molte repliche su
+pochi nodi (accetta una distribuzione 4-3-3 dove l'anti-affinity dura
+fallirebbe). Entrambe le alternative sono nel manifest, commentate.
 
-**Cancellare un segreto non lo rimuove dalla storia Git.** Se un segreto vero
-finisce in un commit, l'unica risposta corretta è **ruotarlo**.
+## `StatefulSet` per il database, `Deployment` per il web
 
----
+Un webserver è senza stato: i pod sono intercambiabili e sostituibili in
+qualsiasi ordine. Un database no — ha identità e un volume che deve seguirlo.
+
+Conseguenza dello storage `local-path`: il volume è una directory sul disco di un
+nodo, quindi il PersistentVolume nasce con una `nodeAffinity` che **inchioda il
+pod a quel nodo**. Se il nodo cade, MySQL non riparte altrove e i dati non sono
+replicati. È il comportamento atteso dallo storage locale, ed è il motivo per cui
+in produzione i database stanno su storage di rete o si replicano a livello
+applicativo.
+
+## NodePort invece di Ingress
+
+Richiesto dal lab, e didatticamente sensato: il NodePort apre la porta su
+**tutti** i nodi, non solo su quelli che ospitano un pod. Una richiesta a un nodo
+"vuoto" viene inoltrata da kube-proxy attraverso la rete dei pod — il che rende
+visibile il livello che un Ingress controller poi nasconde.
+
+Il bilanciamento è probabilistico e avviene **per connessione**, non per
+richiesta HTTP: un client con connessione persistente resta legato a un pod.
+
+## Segreti: una sorgente, due oggetti derivati
+
+Un `Secret` vive dentro un namespace e non è leggibile da altri, quindi
+l'applicazione in `web` e il database in `db` richiedono due oggetti distinti —
+con **nomi di chiave diversi** (`DB_PASSWORD` contro `MYSQL_PASSWORD`).
+
+Invece di due file da tenere sincronizzati a mano, `scripts/gen-secrets.sh` li
+deriva entrambi da un'unica sorgente fuori da Git, mappando i nomi con
+`env` + `secretKeyRef`. I due Secret ricevono **sottoinsiemi diversi**:
+l'applicazione non riceve la password di root, che non le serve.
+
+Un `Secret` Kubernetes è codificato in base64, **non cifrato**: chiunque possa
+leggere l'oggetto ne legge il valore. Per versionarli servirebbe SOPS o Sealed
+Secrets — segnato tra le cose da fare.
 
 # Stato
 
