@@ -50,14 +50,17 @@ spec:
       #         app: web
 
       containers:
-        - name: nginx
-          image: nginx:1.27-alpine
+        - name: menu
+          image: ghcr.io/martinazelli/menu:v2
           ports:
             - name: http
-              containerPort: 80
+              containerPort: 8000
+          envFrom:
+            - secretRef:
+                name: db-connection
           resources:
             requests:
-              memory: "64Mi"
-              cpu: "50m"
-            limits:
               memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"

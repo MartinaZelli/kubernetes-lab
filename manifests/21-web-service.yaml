@@ -12,6 +12,6 @@ spec:
   ports:
     - name: http
       port: 80 # porta del Service all'interno del cluster: altri pod useranno web:80
-      targetPort: 80 # porta su cui ascolta il container
+      targetPort: 8000 # porta su cui ascolta il container
       nodePort: 30080 # la porta aperta su ogni nodo, verso l'esterno
       # Perché non è la soluzione di produzione: una porta strana su ogni nodo, e devi sapere l'IP di un nodo. Un ingress controller invece ti dà un punto d'ingresso unico sulla 80/443 con routing per nome host. Il tuo compito dice di evitarlo per ora — giustamente, perché prima devi vedere il livello sotto.

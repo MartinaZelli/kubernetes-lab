@@ -1,0 +1,34 @@
+apiVersion: batch/v1 # i Job stanno nel gruppo batch, non in apps né nel core.
+kind: Job # Un Job è un pod che deve terminare. È la differenza con Deployment e StatefulSet, che tengono i pod in vita per sempre. Kubernetes considera il Job riuscito quando il container esce con codice 0.
+metadata:
+  name: db-init
+  namespace: web
+  labels:
+    progetto: menu
+spec:
+  backoffLimit: 3 # backoffLimit: 3 è il numero di tentativi di riavvio del container prima che il Job fallisca. Se il container esce con codice 0, il Job è considerato riuscito e non viene riavviato.
+  ttlSecondsAfterFinished: 3600 # il Job e il suo pod si autocancellano un'ora dopo il completamento. Senza, restano lì in eterno a sporcare kubectl get pods.
+  template:
+    metadata:
+      labels:
+        app: db-init
+        progetto: menu
+    spec:
+      restartPolicy: OnFailure # restartPolicy: OnFailure è obbligatorio nei Job. Riavvia il container solo se esce con errore.
+      containers:
+        - name: popola-db
+          image: ghcr.io/martinazelli/menu:v2
+          command: ["python3", "popola_db/popola_db.py"] # command sovrascrive il CMD del Dockerfile. È la stessa immagine dell'app, comando diverso — la traduzione esatta del tuo docker-compose.
+          env:
+            - name: PYTHONPATH
+              value: /app
+              # PYTHONPATH: /app serve perché lo script gira da /app/popola_db/ ma importa from src.database import ..., e src sta in /app. Preso dal docker-compose: senza, l'import fallisce.
+          envFrom:
+            - secretRef:
+                name: db-connection #envFrom con db-connection funziona senza mappature perché il Secret ha già i nomi DB_* che lo script si aspetta.
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
