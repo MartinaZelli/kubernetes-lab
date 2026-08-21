@@ -1,0 +1,13 @@
+apiVersion: operator.tigera.io/v1
+kind: Installation #kind: Installation è uno dei tipi che le CRD hanno appena insegnato al cluster. Non esiste in Kubernetes standard: kubectl get installation funziona solo perché Calico l'ha registrato.
+metadata:
+  name: default
+spec:
+  calicoNetwork:
+    ipPools:
+      - name: default-ipv4-ippool
+        blockSize: 26 # Calico non assegna gli indirizzi uno alla volta: ritaglia blocchi e ne affida uno a ciascun nodo, che poi li distribuisce ai propri pod senza dover chiedere ogni volta. Un /26 sono 64 indirizzi. Su un /16 ci stanno 1024 blocchi, quindi il limite pratico è ampio.
+        cidr: 10.244.0.0/16 # il valore che deve coincidere con il --pod-network-cidr passato a kubeadm init. Non è il 192.168.0.0/16 degli esempi ufficiali, che collide con la tua LAN e con la rete delle VM.
+        encapsulation: VXLANCrossSubnet # Un pod su un nodo deve raggiungere un pod su un altro nodo, ma la rete sottostante (192.168.150.0/24) non sa nulla degli indirizzi 10.244.x.x. La soluzione è incapsulare: il pacchetto originale viene messo dentro un altro pacchetto indirizzato tra i due nodi, e spacchettato all'arrivo. È lo stesso principio del NAT di libvirt, un livello più su. Il suffisso CrossSubnet significa: incapsula solo quando i due nodi stanno su sottoreti diverse; se sono sullo stesso segmento — come i tuoi tre — usa il routing diretto, che è più veloce perché evita il costo dell'incapsulamento.
+        natOutgoing: Enabled # quando un pod contatta l'esterno, il suo indirizzo 10.244.x.x viene tradotto in quello del nodo. Senza, i pacchetti uscirebbero con un mittente che nessuno sa come raggiungere per la risposta. Ancora NAT, terzo livello.
+        nodeSelector: all() #questo pool vale per tutti i nodi. Calico permette pool diversi per gruppi di nodi (utile in ambienti misti), qui non serve.

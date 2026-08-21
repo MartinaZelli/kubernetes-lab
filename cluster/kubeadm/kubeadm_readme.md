@@ -263,6 +263,396 @@ stessa filosofia del `jq` con le quadre vuote al posto della chiave del registry
 
 ---
 
+# Fase 3 — I binari di Kubernetes
+
+I pacchetti **non stanno nei repository Ubuntu**: Kubernetes ha un proprio
+repository, `pkgs.k8s.io`, **separato per versione minore**.
+
+```bash
+for n in ka-cp ka-w1 ka-w2; do ssh $n 'sudo mkdir -p /etc/apt/keyrings && curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.36/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg && echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.36/deb/ /" | sudo tee /etc/apt/sources.list.d/kubernetes.list > /dev/null && echo "$(hostname): repo aggiunto"'; done
+```
+
+```bash
+for n in ka-cp ka-w1 ka-w2; do ssh $n 'sudo apt-get update > /dev/null 2>&1 && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y kubelet kubeadm kubectl > /dev/null 2>&1 && sudo apt-mark hold kubelet kubeadm kubectl > /dev/null && echo "$(hostname): $(kubeadm version -o short)"'; done
+```
+
+**La chiave GPG.** apt non si fida di un repository qualunque: ogni pacchetto è
+firmato crittograficamente e apt verifica la firma con la chiave pubblica del
+progetto. Senza, chi controllasse la rete potrebbe servire pacchetti manomessi.
+`gpg --dearmor` converte la chiave dal formato testuale (`-----BEGIN PGP PUBLIC
+KEY-----`) a quello binario che apt si aspetta.
+
+**`signed-by=`** lega quella chiave **a quel solo repository**. È l'approccio
+moderno: il vecchio `apt-key add` metteva tutto in un portachiavi globale, dove
+una chiave qualsiasi poteva firmare pacchetti di qualsiasi origine.
+
+**`v1.36` nell'URL.** Non esiste un repository generico "ultimo Kubernetes":
+ognuno serve **una sola versione minore**. È voluto — passare da 1.36 a 1.37
+richiede la procedura `kubeadm upgrade` e non deve mai succedere per caso durante
+un `apt upgrade`.
+
+**I tre binari.** `kubelet` è l'agente che gira su ogni nodo e avvia i container
+assegnati: è l'unico componente di Kubernetes che sia un vero servizio systemd.
+`kubeadm` costruisce il cluster. `kubectl` è il client.
+
+**`apt-mark hold`** impedisce ad apt di aggiornarli. Kubernetes tollera uno
+scarto limitato tra le versioni dei componenti: un kubelet aggiornato da solo
+mentre il control plane resta indietro rompe il nodo.
+
+---
+
+# Fase 4 — `kubeadm init`
+
+```bash
+ssh ka-cp 'sudo kubeadm init --pod-network-cidr=10.244.0.0/16 --apiserver-advertise-address=192.168.150.20' 2>&1 | tail -30
+```
+
+| Flag | Perché |
+|---|---|
+| `--pod-network-cidr=10.244.0.0/16` | da quale intervallo assegnare gli IP dei pod. **Deve coincidere** con il CIDR configurato in Calico |
+| `--apiserver-advertise-address=192.168.150.20` | quale indirizzo l'API server pubblica agli altri nodi |
+
+`10.244.0.0/16` è scelto per non collidere con il `10.42.0.0/16` di k3s: i sei
+nodi condividono lo stesso segmento di rete.
+
+`--apiserver-advertise-address` non sarebbe strettamente necessario (kubeadm
+sceglierebbe l'IP dell'interfaccia con la rotta di default), ma essere espliciti
+evita sorprese su macchine con più interfacce. **Effetto collaterale utile:** il
+kubeconfig generato contiene già l'indirizzo giusto, mentre quello di k3s va
+corretto con un `sed`.
+
+## Cosa fa davvero questo comando
+
+Tutto ciò che k3s nascondeva:
+
+1. esegue i **controlli preflight** (swap, moduli, sysctl, cgroup driver, porte)
+2. scarica le immagini dei componenti del control plane
+3. genera **l'intera infrastruttura di certificati** in `/etc/kubernetes/pki/`
+4. scrive i **static pod** in `/etc/kubernetes/manifests/`
+5. avvia il kubelet, che legge quei file e fa partire i container
+6. crea i kubeconfig per admin, kubelet, scheduler e controller manager
+
+## I static pod
+
+```bash
+ssh ka-cp 'ls /etc/kubernetes/manifests/'
+```
+
+```
+etcd.yaml  kube-apiserver.yaml  kube-controller-manager.yaml  kube-scheduler.yaml
+```
+
+Il kubelet legge questa directory **direttamente** e avvia ciò che ci trova,
+senza chiedere a nessuno. Deve funzionare così per forza: **l'API server non può
+essere gestito dall'API server**. È il problema dell'uovo e della gallina,
+risolto dando al kubelet la capacità di avviare cose da solo.
+
+Conseguenza pratica: **si modificano con un editor di testo**. Cambiare un flag
+dell'apiserver significa editare quel file; il kubelet se ne accorge e riavvia il
+container.
+
+Si riconoscono anche dai nomi: `etcd-k8s2-cp` porta in coda l'hostname del nodo
+che li ospita, invece del suffisso casuale dei pod creati da un Deployment.
+
+## La PKI
+
+```bash
+ssh ka-cp 'ls /etc/kubernetes/pki/'
+```
+
+Una CA per il cluster (`ca.crt`/`ca.key`), una **separata** per etcd,
+certificati per apiserver e per i suoi client, `sa.key`/`sa.pub` per firmare i
+token dei ServiceAccount. Ogni comunicazione interna a Kubernetes è autenticata
+con TLS reciproco.
+
+```bash
+ssh ka-cp 'sudo kubeadm certs check-expiration'
+```
+
+## I cinque kubeconfig
+
+```bash
+ssh ka-cp 'ls /etc/kubernetes/*.conf'
+```
+
+`admin.conf`, `kubelet.conf`, `controller-manager.conf`, `scheduler.conf`,
+`super-admin.conf`. Ogni componente ha la **propria identità** e i propri
+permessi: minimo privilegio applicato dentro il cluster.
+
+```bash
+ssh ka-cp 'sudo cat /etc/kubernetes/admin.conf' > ~/.kube/config-kubeadm && chmod 600 ~/.kube/config-kubeadm
+```
+
+Fusione con il kubeconfig esistente (stessa procedura di k3s):
+
+```bash
+cp ~/.kube/config ~/.kube/config.backup-$(date +%F) && KUBECONFIG=~/.kube/config:~/.kube/config-kubeadm kubectl config view --flatten > ~/.kube/merged && KUBECONFIG=~/.kube/merged kubectl config get-contexts
+```
+
+```bash
+mv ~/.kube/merged ~/.kube/config && chmod 600 ~/.kube/config && kubectl config rename-context kubernetes-admin@kubernetes kubeadm
+```
+
+## Il nodo è `NotReady`, ed è atteso
+
+```bash
+kubectl describe node k8s2-cp | grep -A3 "Ready "
+```
+
+```
+Ready   False   KubeletNotReady   container runtime network not ready:
+NetworkReady=false reason:NetworkPluginNotReady message:Network plugin
+returns error: cni plugin not initialized
+```
+
+Il kubelet sa che manca la rete dei pod e si rifiuta di dichiarare il nodo
+disponibile: se accettasse pod, quelli nascerebbero senza connettività.
+
+---
+
+# Fase 5 — Calico
+
+## Perché serve un CNI
+
+Kubernetes **non implementa** la rete dei pod: definisce un'interfaccia (**CNI**,
+Container Network Interface) e lascia che qualcun altro la realizzi. È una scelta
+di progetto — ambienti diversi hanno esigenze di rete diverse.
+
+k3s include Flannel già configurato. Su kubeadm il CNI è una scelta, e qui è
+**Calico** — più ricco, e soprattutto **applica davvero le NetworkPolicy**, cosa
+che Flannel non fa.
+
+## Trovare la versione corrente
+
+```bash
+curl -s https://api.github.com/repos/projectcalico/calico/releases/latest | jq -r '.tag_name, .published_at'
+```
+
+L'API di GitHub espone `releases/latest` per qualsiasi repository pubblico: è la
+fonte autorevole, sempre aggiornata, e non dipende da un blog vecchio di mesi.
+
+È lo **stesso metodo** di `tofu providers schema -json` e `containerd config
+default`: chiedere allo strumento invece di fidarsi degli esempi. Terzo caso in
+cui evita un errore.
+
+## Installazione
+
+```bash
+kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.32.1/manifests/tigera-operator.yaml
+```
+
+⚠️ Nelle versioni recenti questo manifest **include già le CRD**. Applicare anche
+`operator-crds.yaml` produce una lunga lista di `AlreadyExists`: innocui, ma
+inutili. `create` (non `apply`) rifiuta di sovrascrivere, ed è la protezione che
+evita danni quando si sbaglia ordine.
+
+Si usa `create` anche per un motivo tecnico: `apply` salva l'intero oggetto in
+un'annotazione per calcolare i diff futuri, e su manifest oltre i 256 KB dà
+errore.
+
+### CRD e operator
+
+Le **CRD** (Custom Resource Definition) insegnano all'API server tipi di oggetto
+nuovi. Kubernetes conosce di suo Pod, Service, Deployment — ma è **estensibile**:
+una CRD dichiara "esiste un oggetto `Installation`, fatto così". Da quel momento
+`kubectl get installation` funziona come `kubectl get pods`, con la stessa
+validazione e gli stessi permessi.
+
+È il meccanismo che rende Kubernetes una piattaforma e non solo un orchestratore.
+
+Un **operator** è un controller che gira nel cluster e gestisce un componente
+complesso al posto tuo. Si dichiara *cosa si vuole*; lui crea deployment,
+daemonset e configurazioni, e sorveglia che lo stato resti quello dichiarato.
+
+È il modello dichiarativo applicato all'**installazione del software**: invece di
+uno script che fa venti cose, si dichiara il risultato e un controller lo
+realizza — riparandolo se si scosta. La differenza tra `apt install` e un
+Deployment.
+
+## La risorsa `Installation`
+
+`cluster/kubeadm/calico-installation.yaml`:
+
+```yaml
+apiVersion: operator.tigera.io/v1
+kind: Installation
+metadata:
+  name: default
+spec:
+  calicoNetwork:
+    ipPools:
+      - name: default-ipv4-ippool
+        blockSize: 26
+        cidr: 10.244.0.0/16
+        encapsulation: VXLANCrossSubnet
+        natOutgoing: Enabled
+        nodeSelector: all()
+```
+
+| Campo | Significato |
+|---|---|
+| `cidr` | **deve coincidere** con `--pod-network-cidr` di `kubeadm init` |
+| `blockSize: 26` | Calico ritaglia blocchi da 64 indirizzi e ne affida uno a ciascun nodo, che poi li distribuisce ai propri pod senza chiedere ogni volta |
+| `encapsulation` | vedi sotto |
+| `natOutgoing: Enabled` | quando un pod contatta l'esterno, il suo `10.244.x.x` viene tradotto nell'indirizzo del nodo |
+| `nodeSelector: all()` | il pool vale per tutti i nodi |
+
+⚠️ **Non usare il `192.168.0.0/16` degli esempi ufficiali di Calico**: collide
+sia con la LAN di casa (`192.168.1.0/24`) sia con la rete delle VM
+(`192.168.150.0/24`).
+
+### L'incapsulamento
+
+Un pod su un nodo deve raggiungere un pod su un altro nodo, ma la rete
+sottostante (`192.168.150.0/24`) non sa nulla degli indirizzi `10.244.x.x`.
+
+La soluzione è **incapsulare**: il pacchetto originale viene messo dentro un
+altro pacchetto indirizzato tra i due nodi, e spacchettato all'arrivo. Stesso
+principio del NAT di libvirt, un livello più su.
+
+`VXLANCrossSubnet` incapsula **solo** quando i due nodi stanno su sottoreti
+diverse. Se sono sullo stesso segmento — come qui — usa il routing diretto, più
+veloce perché evita il costo dell'incapsulamento.
+
+## Seguire l'installazione
+
+```bash
+kubectl get tigerastatus
+```
+
+```
+NAME      AVAILABLE   PROGRESSING   DEGRADED   SINCE   MESSAGE
+calico    False       True          False      21s
+ippools   True        False         False      21s     All objects available
+tiers                               True               Waiting for Tigera API server to be ready
+```
+
+I log dell'operator durante l'avvio sono **pieni di righe `error` con
+stacktrace**. Non è un guasto: la funzione che segnala uno stato temporaneo si
+chiama `SetDegraded`, e Go allega sempre lo stacktrace anche quando il messaggio
+significa "non ancora pronto, riprovo".
+
+Merita attenzione solo `the object has been modified; please apply your changes
+to the latest version`: è **concorrenza ottimistica**. Due controller hanno
+provato a scrivere lo stesso oggetto insieme; Kubernetes ne fa fallire uno, che
+riprova con la versione aggiornata. È il meccanismo che garantisce la coerenza,
+non un errore.
+
+**Il riassunto affidabile è `tigerastatus`, non i log.**
+
+```bash
+kubectl get pods -n calico-system -o wide
+```
+
+Il namespace `calico-system` lo crea l'operator. Dentro:
+
+- **`calico-node`** — un **DaemonSet**: l'agente che programma la rete su ogni
+  nodo
+- **`calico-typha`** — un proxy che riduce il carico sull'API server; il numero
+  di repliche dipende dalla dimensione del cluster
+- **`calico-kube-controllers`** — sincronizza lo stato con l'API server
+- **`csi-node-driver`** — supporto per i volumi
+
+### Il DaemonSet
+
+Un **Deployment** dice "voglio N repliche, mettile dove vuoi". Un **DaemonSet**
+dice "voglio **esattamente una** copia su ogni nodo". È il modello giusto per gli
+agenti di sistema: rete, log, monitoraggio.
+
+Effetto visibile: al join dei worker, `calico-node` e `csi-node-driver` sono
+comparsi **da soli** sulle macchine nuove.
+
+### `hostNetwork`
+
+`calico-node` e `calico-typha` hanno come IP `192.168.150.20`, cioè l'indirizzo
+**del nodo**, non uno della rete pod. Sono pod con `hostNetwork: true`:
+condividono lo stack di rete della macchina.
+
+Deve essere così — `calico-node` è l'agente che *costruisce* la rete dei pod, non
+può dipendere da essa per funzionare. Sarebbe come pretendere di salire su una
+scala che si sta ancora montando.
+
+Gli altri pod hanno invece IP come `10.244.80.65`, `10.244.10.129`,
+`10.244.207.193`: terzo ottetto diverso per nodo, perché ciascuno ha ricevuto un
+blocco `/26` diverso. È il `blockSize: 26` visibile nei fatti.
+
+Al termine:
+
+```bash
+kubectl get nodes
+```
+
+Il nodo passa da `NotReady` a **`Ready`**.
+
+---
+
+# Fase 6 — Join dei worker
+
+```bash
+ssh ka-cp 'sudo kubeadm token create --print-join-command'
+```
+
+I token di bootstrap **scadono dopo 24 ore** per progetto: sono credenziali di
+ammissione al cluster. Questo comando ne crea uno nuovo e compone il comando
+completo.
+
+Per evitare di trascrivere a mano stringhe lunghe:
+
+```bash
+JOIN=$(ssh ka-cp 'sudo kubeadm token create --print-join-command') && echo "${#JOIN} caratteri"
+```
+
+```bash
+ssh ka-w1 "sudo ${JOIN}" && ssh ka-w2 "sudo ${JOIN}"
+```
+
+Virgolette **doppie** attorno a `${JOIN}` perché bash sostituisca la variabile
+prima di spedire il comando.
+
+⚠️ Il token finisce nella `bash_history` delle VM. Accettabile in un lab.
+
+## I due parametri del join
+
+| Parametro | A cosa serve |
+|---|---|
+| `--token` | dimostra al control plane che il nodo **ha diritto** di entrare |
+| `--discovery-token-ca-cert-hash` | dimostra al nodo che il control plane **è autentico** |
+
+È autenticazione **reciproca**. Senza l'hash della CA, qualcuno potrebbe fingersi
+il control plane e impossessarsi del nodo.
+
+## Il TLS bootstrap
+
+L'output del join termina con:
+
+```
+* Certificate signing request was sent to apiserver and a response was received.
+* The Kubelet was informed of the new secure connection details.
+```
+
+Il token è servito **solo per il primo contatto**. Con quello il nodo ha chiesto
+alla CA del cluster di firmargli un certificato personale, e da lì in poi si
+autentica con quello — il token non serve più.
+
+Si usa una credenziale condivisa e di breve durata per ottenerne una individuale
+e duratura. È lo stesso motivo per cui i token scadono in 24 ore: devono servire
+per un attimo, non per sempre.
+
+## Verifica
+
+```bash
+kubectl get nodes -o wide
+```
+
+I worker restano `NotReady` per una trentina di secondi: Calico deve avviare il
+proprio `calico-node` su ciascuno, e prima che la rete sia programmata il kubelet
+non li dichiara pronti.
+
+`ROLES` mostra `<none>` sui worker: in Kubernetes il ruolo è **solo
+un'etichetta**, e la convenzione è che i worker non ne abbiano.
+
+---
+
 # Anatomia dei comandi
 
 Sezione di riferimento per i costrutti bash usati sopra.
@@ -387,10 +777,10 @@ significato di un comando.
 
 - [x] Fase 1 — prerequisiti del kernel
 - [x] Fase 2 — containerd con `SystemdCgroup = true`
-- [ ] Fase 3 — kubelet, kubeadm, kubectl
-- [ ] Fase 4 — `kubeadm init`
-- [ ] Fase 5 — Calico
-- [ ] Fase 6 — join dei worker
+- [x] Fase 3 — kubelet, kubeadm, kubectl (v1.36.4)
+- [x] Fase 4 — `kubeadm init`
+- [x] Fase 5 — Calico v3.32.1
+- [x] Fase 6 — join dei worker
 - [ ] Fase 7 — storage local-path
 - [ ] Fase 8 — l'applicazione
 - [ ] Fase 9 — confronto con k3s
