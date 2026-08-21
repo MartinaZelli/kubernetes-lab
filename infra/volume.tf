@@ -46,4 +46,11 @@ resource "libvirt_volume" "vm_init_iso" {
       url = libvirt_cloudinit_disk.vm_init[each.key].path
     }
   }
+  # Il volume ISO viene letto da cloud-init SOLO al primo avvio della VM.
+  # Cambiarne il contenuto su una macchina già in funzione non ha alcun effetto,
+  # e il provider non sa aggiornare un volume (Storage volumes cannot be updated).
+  # Per cambiare davvero il cloud-init: tofu apply -replace='libvirt_domain.vm["chiave"]'
+  lifecycle {
+    ignore_changes = [create]
+  }
 }

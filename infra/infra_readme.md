@@ -11,16 +11,41 @@ Senza quello `tofu apply` fallisce.
 
 ## Cosa crea
 
-| Nodo | Ruolo | IP | RAM | vCPU | Disco |
-|---|---|---|---|---|---|
-| `k8s-cp` | control plane | 192.168.150.10 | 4 GB | 2 | 20 GB |
-| `k8s-w1` | worker | 192.168.150.11 | 2 GB | 2 | 20 GB |
-| `k8s-w2` | worker | 192.168.150.12 | 2 GB | 2 | 20 GB |
+**Sei** VM, divise in due cluster indipendenti sulla stessa rete libvirt.
+
+| Chiave | Nodo | Cluster | IP | RAM | vCPU | Disco |
+|---|---|---|---|---|---|---|
+| `cp` | `k8s-cp` | k3s | 192.168.150.10 | 4 GB | 2 | 20 GB |
+| `w1` | `k8s-w1` | k3s | 192.168.150.11 | 2 GB | 2 | 20 GB |
+| `w2` | `k8s-w2` | k3s | 192.168.150.12 | 2 GB | 2 | 20 GB |
+| `cpka` | `k8s2-cp` | kubeadm | 192.168.150.20 | 4 GB | 2 | 20 GB |
+| `wka1` | `k8s2-w1` | kubeadm | 192.168.150.21 | 2 GB | 2 | 20 GB |
+| `wka2` | `k8s2-w2` | kubeadm | 192.168.150.22 | 2 GB | 2 | 20 GB |
 
 Più la rete NAT `k8s-lab` (`192.168.150.0/24`, gateway `192.168.150.1` = l'host).
 
+Totale allocato: 16 GB di RAM, 12 vCPU. Gli IP `.13`–`.19` sono lasciati liberi
+per eventuali nodi aggiuntivi del primo cluster.
+
+I MAC codificano il cluster nel terzo ottetto: `02:00:00:**02**:…` per k3s,
+`02:00:00:**03**:…` per kubeadm. Si riconosce a colpo d'occhio a chi appartiene
+una macchina guardando `virsh domiflist`.
+
 Sistema operativo: Ubuntu 24.04 (noble) da immagine cloud, configurata al primo
 avvio da cloud-init.
+
+### Il campo `cluster`
+
+Ogni VM dichiara a quale cluster appartiene. Non serve solo a documentare: è il
+criterio con cui `hosts_by_cluster` filtra le righe di `/etc/hosts`, così **ogni
+nodo conosce per nome solo i propri compagni di cluster**.
+
+Senza quel filtro, il `user_data` di ogni VM dipenderebbe da **tutte** le altre:
+aggiungere una macchina modificherebbe il cloud-init di tutte, con conseguenze
+serie (vedi trappola 10).
+
+Effetto collaterale voluto: da `k8s-cp` **non** si risolve `k8s2-cp`. I due
+cluster non devono parlarsi.
 
 ## File
 
@@ -296,7 +321,17 @@ Approccio mirato: si configura il programma, non si disattiva IPv6 nel kernel.
 Toccare il kernel per risolvere un problema di un singolo programma è il tipo di
 soluzione che si ritorce contro sei mesi dopo.
 
-## 8. `Exec format error` (status 203/EXEC)
+## 8. Comandi interattivi e copia-incolla in blocco
+
+Incollare più comandi insieme si rompe con qualunque comando che si fermi ad
+aspettare una risposta: `ssh` al primo contatto con un host, `sudo` che chiede
+la password, `tofu apply` che chiede `yes`. La riga successiva del blocco viene
+letta come risposta.
+
+Sintomo tipico: `Host key verification failed` senza che sia mai apparsa la
+domanda.
+
+## 9. `Exec format error` (status 203/EXEC)
 
 Un file eseguibile che systemd non riesce a lanciare: il kernel non trova uno
 shebang valido. Cause: shebang non sulla prima riga, spazi o BOM prima di `#!`,
@@ -310,6 +345,93 @@ sed -i 's/\r$//' script.sh           # rimuove i \r
 
 Si corregge **il sorgente nel repo**, non la copia installata: quella verrebbe
 sovrascritta al prossimo deploy.
+
+---
+
+## 10. `Storage volumes cannot be updated` — la trappola ricorrente
+
+**Sintomo.** `tofu plan` dichiara `N to change` sui volumi ISO, ma `tofu apply`
+fallisce:
+
+```
+Error: Update Not Supported
+  with libvirt_volume.vm_init_iso["w1"]
+Storage volumes cannot be updated. All changes require replacement.
+```
+
+Il `plan` promette un'operazione che l'`apply` dello stesso provider rifiuta: è
+un'incoerenza del provider, non un errore di configurazione.
+
+**La catena che la innesca:**
+
+1. `volume.tf` definisce `vm_init_iso.create.content.url =
+   libvirt_cloudinit_disk.vm_init[each.key].path`
+2. il `path` di un `libvirt_cloudinit_disk` è un file temporaneo con un id nel
+   nome: cambia a ogni ricreazione
+3. qualunque modifica al `user_data` ricrea il cloudinit disk
+4. il volume vede cambiare l'`url` e chiede un aggiornamento in-place
+5. il provider non sa aggiornare un volume → errore
+
+**La causa a monte** era `hosts_entries`, che faceva dipendere il `user_data` di
+ogni VM da tutte le altre. Aggiungere tre macchine ne modificava sei.
+
+**Correzione in due parti.**
+
+*Disaccoppiare* — `hosts_by_cluster` al posto di `hosts_entries`, così i cloud-init
+di cluster diversi sono indipendenti.
+
+*Dichiarare la verità* — un blocco `lifecycle` su entrambe le risorse:
+
+```hcl
+# in volume.tf, dentro vm_init_iso
+lifecycle {
+  ignore_changes = [create]
+}
+
+# in cloud_init.tf, dentro vm_init
+lifecycle {
+  ignore_changes = [user_data, network_config, meta_data]
+}
+```
+
+`ignore_changes` non è un modo per zittire l'errore: dice che quell'attributo,
+**dopo la creazione, non è più sotto il controllo di OpenTofu**. Ed è
+letteralmente vero — cloud-init legge il disco una volta sola, al primo boot.
+Prima il codice pretendeva di gestire un valore che nella realtà non ha più
+effetto.
+
+**Costo:** una modifica reale al cloud-init non si propaga più da sola. Ma
+sappiamo (trappola 5) che l'unico modo di applicarla è comunque ricreare la
+macchina. Ora è esplicito:
+
+```bash
+tofu apply -replace='libvirt_domain.vm["cp"]'
+```
+
+**Come si riconosce che ha funzionato:** `Plan: 3 to add, 0 to change,
+0 to destroy` — nessun `vm_init_iso` nel piano.
+
+## 11. Rinominare le chiavi della mappa
+
+Le chiavi di `vms_raw` (`"cp"`, `"wka1"`…) sono l'**identità** delle risorse
+nello stato: la VM esiste come `libvirt_domain.vm["cp"]`. Cambiare una chiave
+significa, per OpenTofu, distruggere una risorsa e crearne un'altra.
+
+Per rinominare senza toccare l'infrastruttura si usa `tofu state mv`:
+
+```bash
+cp terraform.tfstate terraform.tfstate.backup-$(date +%F)
+tofu state mv 'libvirt_domain.vm["cp"]' 'libvirt_domain.vm["cpk3s"]'
+```
+
+Ogni chiave compare in **quattro** risorse — `libvirt_domain.vm`,
+`libvirt_volume.vm_disk`, `libvirt_volume.vm_init_iso`,
+`libvirt_cloudinit_disk.vm_init` — quindi servono quattro `state mv` per nodo.
+Flusso: modificare il file, fare gli `state mv`, poi `plan` deve dire
+`No changes`.
+
+Diverso il campo `hostname`: quello entra nel `user_data`, quindi cambiarlo
+richiede davvero di ricreare la VM.
 
 ---
 

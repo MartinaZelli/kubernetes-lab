@@ -58,22 +58,36 @@ incontrate.
 
 ## Architettura
 
-| Nodo | Ruolo | IP | RAM | vCPU |
-|---|---|---|---|---|
-| `k8s-cp` | control plane (schedulabile su k3s) | 192.168.150.10 | 4 GB | 2 |
-| `k8s-w1` | worker | 192.168.150.11 | 2 GB | 2 |
-| `k8s-w2` | worker | 192.168.150.12 | 2 GB | 2 |
+**Due cluster indipendenti** sulla stessa rete libvirt, per poter confrontare le
+due installazioni fianco a fianco.
 
-Rete NAT libvirt `192.168.150.0/24`, gateway `192.168.150.1` (l'host).
+| Cluster | Control plane | Worker | Contesto kubectl |
+|---|---|---|---|
+| k3s | `k8s-cp` (.10) | `k8s-w1` (.11), `k8s-w2` (.12) | `k3s` |
+| kubeadm | `k8s2-cp` (.20) | `k8s2-w1` (.21), `k8s2-w2` (.22) | *(da creare)* |
 
-**Tre reti sovrapposte**, che è la cosa che confonde di più all'inizio:
+Control plane 4 GB / 2 vCPU, worker 2 GB / 2 vCPU. Rete NAT libvirt
+`192.168.150.0/24`, gateway `192.168.150.1` (l'host).
+
+Su k3s il nodo server è schedulabile; su kubeadm è tainted, quindi i pod utente
+girano solo sui due worker.
+
+### Le sottoreti
+
+Quattro livelli sovrapposti, ed è la cosa che confonde di più all'inizio:
 
 | Rete | Chi ci sta |
 |---|---|
 | `192.168.1.0/24` | la LAN di casa, dove sta l'host |
-| `192.168.150.0/24` | le VM, sul bridge NAT di libvirt |
-| `10.42.0.0/16` | i pod, con un blocco `/24` per nodo |
-| `10.43.0.0/16` | i Service (ClusterIP), indirizzi virtuali gestiti da kube-proxy |
+| `192.168.150.0/24` | le sei VM, sul bridge NAT di libvirt |
+| pod | `10.42.0.0/16` su k3s, **`10.244.0.0/16`** su kubeadm |
+| service | `10.43.0.0/16` su k3s, `10.96.0.0/12` su kubeadm |
+
+Le sottoreti dei pod dei due cluster **devono differire**: i nodi condividono lo
+stesso segmento di rete, e sovrapporle produrrebbe rotte in conflitto.
+
+Da evitare in particolare il `192.168.0.0/16` che Calico propone come default:
+collide sia con la LAN di casa sia con la rete delle VM.
 
 Applicazione distribuita su due namespace:
 
@@ -134,7 +148,8 @@ registra la versione esatta del provider e i suoi checksum.
 
 Un bridge metterebbe le VM sulla LAN di casa, ma resta appeso all'interfaccia
 fisica: su un portatile, staccare il cavo significa nodi che non si vedono più e
-control plane che li marca `NotReady`.
+control plane che li marca `NotReady`. Il bridging inoltre non funziona su WiFi,
+per come è fatto 802.11.
 
 La rete NAT vive dentro l'host: il cluster regge anche offline. In cambio le VM
 non sono raggiungibili dal resto della LAN — irrilevante qui, perché sia
@@ -145,7 +160,7 @@ non sono raggiungibili dal resto della LAN — irrilevante qui, perché sia
 `kubeadm` applica al control plane la taint
 `node-role.kubernetes.io/control-plane:NoSchedule`. Con due VM resterebbe **un
 solo nodo schedulabile**, e il requisito "due pod su nodi diversi" sarebbe
-complesso da soddisfare.
+impossibile da soddisfare.
 
 Su k3s il nodo server è schedulabile e due basterebbero, ma la stessa
 infrastruttura deve servire entrambe le fasi.
@@ -212,7 +227,8 @@ Secrets — segnato tra le cose da fare.
 | Deployment a 2 repliche con anti-affinity verificata | ✅ |
 | Service NodePort | ✅ |
 | Applicazione reale al posto di nginx | ✅ |
-| Cluster kubeadm | ⬜ |
+| VM per il secondo cluster | ✅ |
+| Cluster kubeadm + Calico | 🔨 in corso |
 
 ## Da fare
 

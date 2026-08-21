@@ -30,7 +30,7 @@ resource "libvirt_cloudinit_disk" "vm_init" {
       - path: /etc/hosts
         content: |
           127.0.0.1   localhost
-          ${join("\n      ", local.hosts_entries)}
+          ${join("\n      ", local.hosts_by_cluster[each.value.cluster])}
           ::1 ip6-localhost ip6-loopback
           fe00::0 ip6-localnet
           ff00::0 ip6-mcastprefix
@@ -66,4 +66,11 @@ resource "libvirt_cloudinit_disk" "vm_init" {
         dhcp6: false
         accept-ra: false
   EOF
+
+  # una volta generato, il cloud-init di una VM esistente
+  # non va più toccato. Le VM nuove ricevono comunque il contenuto corretto
+  # al momento della creazione.
+  lifecycle {
+    ignore_changes = [user_data, network_config, meta_data]
+  }
 }
