@@ -64,7 +64,7 @@ due installazioni fianco a fianco.
 | Cluster | Control plane | Worker | Contesto kubectl |
 |---|---|---|---|
 | k3s | `k8s-cp` (.10) | `k8s-w1` (.11), `k8s-w2` (.12) | `k3s` |
-| kubeadm | `k8s2-cp` (.20) | `k8s2-w1` (.21), `k8s2-w2` (.22) | *(da creare)* |
+| kubeadm | `k8s2-cp` (.20) | `k8s2-w1` (.21), `k8s2-w2` (.22) | `kubeadm` |
 
 Control plane 4 GB / 2 vCPU, worker 2 GB / 2 vCPU. Rete NAT libvirt
 `192.168.150.0/24`, gateway `192.168.150.1` (l'host).
@@ -228,11 +228,12 @@ Secrets — segnato tra le cose da fare.
 | Service NodePort | ✅ |
 | Applicazione reale al posto di nginx | ✅ |
 | VM per il secondo cluster | ✅ |
-| Cluster kubeadm + Calico | 🔨 in corso |
+| Cluster kubeadm + Calico | ✅ |
+| Applicazione su kubeadm | ✅ |
 
 ## Da fare
 
-- [ ] **Fase 2: kubeadm** — l'obiettivo principale che resta
+- [ ] NetworkPolicy tra i namespace (ora possibile: Calico le applica)
 - [ ] Sonde `readiness` e `liveness` (l'app non ha ancora `/health`)
 - [ ] Console seriale nelle VM: `virsh console` non funziona, `vm.tf` definisce
   solo l'output VNC

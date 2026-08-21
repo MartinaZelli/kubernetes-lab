@@ -653,6 +653,296 @@ un'etichetta**, e la convenzione è che i worker non ne abbiano.
 
 ---
 
+# Fase 7 — Storage local-path
+
+Su k3s il provisioner era già presente. È **lo stesso software** — Rancher lo
+distribuisce come progetto a sé, k3s si limita a includerlo.
+
+```bash
+curl -s https://api.github.com/repos/rancher/local-path-provisioner/releases/latest | jq -r '.tag_name, .published_at'
+```
+
+```bash
+kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.37/deploy/local-path-storage.yaml
+```
+
+Qui si usa `apply` e non `create`: il manifest è piccolo e si vuole poterlo
+riapplicare per aggiornamenti.
+
+## Cos'è un provisioner
+
+Un controller in ascolto dei **PersistentVolumeClaim**: quando ne compare uno che
+nomina la sua StorageClass, crea il volume corrispondente.
+
+Senza provisioner un PVC resta `Pending` per sempre — i PersistentVolume
+andrebbero creati a mano, uno per uno. È di nuovo il modello dichiarativo: si
+chiede "5 GB", qualcuno realizza. Nei cloud quel qualcuno crea un disco EBS; qui
+crea una directory su un nodo.
+
+## Impostarla come classe predefinita
+
+Differenza rispetto a k3s: il manifest di Rancher **non** marca la classe come
+default.
+
+```bash
+kubectl patch storageclass local-path -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+```
+
+Prima: `local-path`. Dopo: `local-path (default)`. Non è una colonna della
+tabella — `kubectl` aggiunge il suffisso al nome quando trova l'annotazione
+`storageclass.kubernetes.io/is-default-class: "true"`.
+
+`kubectl patch` modifica un pezzo di un oggetto esistente senza riscriverlo
+tutto: il `-p` prende una porzione di JSON che descrive **solo** ciò che cambia.
+Utile per ritocchi puntuali su oggetti non gestiti con un file proprio.
+
+**Label o annotation?** Le **label** servono a essere *selezionate* (i selector
+le usano); le **annotation** servono a essere *lette* da qualcun altro —
+strumenti, controller, o `kubectl` stesso. Questa è un'annotation perché nessuno
+la usa per filtrare: la legge il controller dei PVC.
+
+### Cosa succede senza una classe predefinita
+
+Un PVC che **non** specifica `storageClassName` resta `Pending` **per sempre, in
+silenzio**. Nessun errore dice "manca una StorageClass di default": il PVC
+aspetta un volume che nessuno creerà, e il pod che lo usa resta a sua volta
+`Pending` con un messaggio generico.
+
+È il tipo di guasto che fa perdere un'ora: nulla è rotto, tutto è "in attesa".
+
+```bash
+kubectl describe pvc NOME -n NAMESPACE | tail -10
+```
+
+Con la classe corretta si vede `Provisioning` e poi `ProvisioningSucceeded`.
+Senza, **nessun evento** — l'assenza è il segnale.
+
+Due dettagli sottili:
+
+- `storageClassName` **assente** e `storageClassName: ""` sono cose diverse.
+  Assente = "usa il default". Stringa vuota = "niente provisioning dinamico, mi
+  lego a un PV creato a mano". Un refuso che trasforma l'uno nell'altro produce
+  un PVC che aspetta per sempre.
+- **Due classi marcate default** è peggio che nessuna: Kubernetes ne sceglie una
+  in modo non deterministico, e si ottengono comportamenti diversi tra un PVC e
+  l'altro senza capire perché.
+
+In questo lab `manifests/11-db-pvc.yaml` dichiara `storageClassName: local-path`
+esplicitamente, quindi funzionerebbe comunque. Il default serve a far comportare
+i due cluster allo stesso modo.
+
+---
+
+# Fase 8 — L'applicazione
+
+**Gli stessi identici manifest applicati su k3s.** Nessuna modifica.
+
+```bash
+kubectl config current-context   # verificare di essere su kubeadm PRIMA di applicare
+```
+
+```bash
+kubectl apply -f manifests/00-namespaces.yaml
+```
+
+```bash
+./scripts/gen-secrets.sh
+```
+
+```bash
+kubectl apply -f manifests/
+```
+
+L'ordine conta: i namespace sono contenitori e Kubernetes rifiuta un oggetto
+destinato a un namespace inesistente; i Secret vanno prima dei workload che li
+montano. I Secret **non** sono in `manifests/` (li crea lo script), quindi il
+passo intermedio è obbligatorio.
+
+`kubectl apply -f` su una **directory** applica ogni file in ordine alfabetico:
+è il motivo della numerazione `00-`, `11-`, `12-`.
+
+Nota che `gen-secrets.sh` non sa nulla di quale cluster stia usando: legge
+`secrets/db.env` e chiama `kubectl`, che va sul contesto attivo. **Stessa
+sorgente, cluster diverso** — il beneficio di aver messo la verità in un file
+invece che nei comandi.
+
+## La differenza attesa rispetto a k3s
+
+I due pod web finiscono **entrambi sui worker**, mai sul control plane: qui la
+taint c'è. Su k3s uno girava su `k8s-cp`.
+
+Con due worker e due repliche l'anti-affinity è comunque soddisfatta — ma con
+**due sole VM** il requisito "due pod su nodi diversi" sarebbe stato impossibile.
+
+---
+
+# Trappole incontrate
+
+## 1. La rete tra nodi non passa — il buco nel firewall dell'host
+
+**Il sintomo iniziale era ingannevole.** La pagina web si caricava, ma ogni
+chiamata all'API falliva con `Server non raggiungibile!`. Il Job di
+inizializzazione andava in `RESTARTS` continui:
+
+```
+Tentativo 10/10: DB su mysql.db.svc.cluster.local non pronto...
+(pymysql.err.OperationalError) (2003, "Can't connect to MySQL server
+on 'mysql.db.svc.cluster.local' ([Errno -3] Try again)")
+```
+
+⚠️ **`[Errno -3] Try again` è un errore di risoluzione DNS, non di connessione.**
+PyMySQL dice "Can't connect to MySQL server" e viene naturale cercare il problema
+su MySQL — ma il codice `-3` viene da `getaddrinfo`, cioè dal risolutore di nomi.
+Il pod non arriva nemmeno a tentare la connessione TCP.
+
+**Regola:** davanti a `Try again` o `Temporary failure`, guardare il DNS, non il
+servizio di destinazione. È lo stesso errore che dava `apt` sulle VM.
+
+### La diagnosi, per esclusione
+
+```bash
+kubectl exec -n web deploy/web -- cat /etc/resolv.conf
+```
+
+Corretto: `nameserver 10.96.0.10`, il Service di CoreDNS. Quindi la
+configurazione è giusta ma il pod non riesce a **parlare** con CoreDNS.
+
+```bash
+kubectl exec -n web deploy/web -- python3 -c "import socket; print(socket.gethostbyname('kubernetes.default.svc.cluster.local'))"
+```
+
+Fallisce anche su un nome che esiste sempre → non è il singolo Service, è il DNS
+in generale.
+
+Test di connettività grezza, aggirando il DNS (nelle immagini Alpine non c'è
+`ping`):
+
+```bash
+kubectl exec -n web POD -- python3 -c "import socket; s=socket.socket(); s.settimeout(3); print(s.connect_ex(('IP',PORTA)))"
+```
+
+`connect_ex` restituisce `0` se la connessione riesce, altrimenti un codice.
+
+| Test | Risultato |
+|---|---|
+| pod → pod **sullo stesso nodo** | `0` ✅ |
+| pod → pod **su nodo diverso** | `11` (timeout) ❌ |
+| pod → IP del Service CoreDNS | `11` ❌ |
+
+⚠️ Attenzione a `deploy/web`: sceglie **un pod a caso** tra le repliche. Con pod
+su nodi diversi il risultato cambia da un'esecuzione all'altra. Per un test
+deterministico va nominato il pod preciso.
+
+### La causa
+
+Il traffico tra pod di nodi diversi esce dalla VM con indirizzi `10.244.x.x` e
+attraversa il bridge di libvirt sull'host Arch. Lì incontra la catena `FORWARD`
+con policy `DROP`, e le regole in `DOCKER-USER` autorizzavano **solo**
+`192.168.150.0/24`. I pacchetti `10.244.x.x` non corrispondevano a nulla e
+venivano scartati.
+
+### Perché non era emerso su k3s
+
+**Flannel usa VXLAN sempre**, anche tra nodi della stessa sottorete: quei
+pacchetti viaggiano incapsulati dentro pacchetti `192.168.150.x`, che le regole
+autorizzavano.
+
+**Calico con `VXLANCrossSubnet` non incapsula** tra nodi della stessa sottorete:
+sceglie il routing diretto perché è più efficiente, e i pacchetti restano
+`10.244.x.x` in chiaro.
+
+La configurazione più efficiente ha rivelato un buco che c'era da giorni.
+
+### La correzione
+
+Tre reti in `scripts/k8s-lab-firewall.sh`, non una:
+
+```bash
+readonly SUBNETS=(
+  "192.168.150.0/24" # VM del lab
+  "10.42.0.0/16"     # pod k3s
+  "10.244.0.0/16"    # pod kubeadm (Calico)
+)
+```
+
+`10.42.0.0/16` è incluso anche se oggi k3s funziona: dipendere dal fatto che
+Flannel incapsuli sempre è fragile.
+
+## 2. `systemctl enable --now` non riesegue un `oneshot` già attivo
+
+Dopo aver aggiornato lo script e rilanciato `host-setup.sh`, le regole nuove
+**non comparivano**.
+
+`host-setup.sh` fa `systemctl enable --now`, ma il servizio risultava già attivo:
+`--now` non riavvia un'unità in esecuzione, e systemd considera un `oneshot` con
+`RemainAfterExit=yes` come "già fatto".
+
+```bash
+sudo systemctl restart k8s-lab-firewall.service
+```
+
+Lo script è "idempotente" solo in apparenza: descrive lo stato desiderato ("il
+servizio è attivo") ma non garantisce che la **versione** attiva sia quella
+nuova. Da correggere sostituendo `enable --now` con `enable` + `restart`.
+
+## 3. Verificare sempre quale copia sta girando
+
+Gli script vengono **installati** in `/usr/local/bin/`: il servizio esegue la
+copia, non il file nel repo.
+
+```bash
+diff scripts/k8s-lab-firewall.sh /usr/local/bin/k8s-lab-firewall.sh && echo "IDENTICI"
+```
+
+`diff` non stampa nulla quando i file sono uguali, e l'`&&` fa comparire
+"IDENTICI". Controllo da fare ogni volta che si modifica uno script installato
+altrove.
+
+## 4. Il Job parte prima che MySQL sia pronto
+
+`popola_db.py` ritenta 10 volte a 5 secondi di distanza: si arrende dopo **50
+secondi**. MySQL impiega più di due minuti al primo avvio (creazione del volume
+più scaricamento di 600 MB di immagine).
+
+Applicando tutto insieme con `apply -f manifests/`, il Job fallisce e
+`restartPolicy: OnFailure` lo rilancia, finché `backoffLimit: 3` non lo dichiara
+`Failed`.
+
+Su k3s non era emerso perché i manifest erano stati applicati in momenti diversi,
+con MySQL già in piedi.
+
+**Rilanciare un Job** (è in gran parte immutabile, `apply` su uno esistente
+fallisce):
+
+```bash
+kubectl delete job -n web db-init && kubectl apply -f manifests/15-app-db-init-job.yaml && kubectl logs -n web job/db-init --follow
+```
+
+Da correggere con un `initContainer` che attende il database, o con più tentativi
+nello script.
+
+## 5. `kubectl logs --previous`
+
+Quando un container va in crash e riparte, `kubectl logs` mostra quello **nuovo**
+— che magari sta ancora provando — mentre l'errore utile sta nell'istanza morta.
+
+```bash
+kubectl logs -n web job/db-init --previous --tail=15
+```
+
+Uno degli strumenti diagnostici più utili con i `CrashLoopBackOff`.
+
+## 6. `AlreadyExists` non è un guasto
+
+Applicando due volte un manifest, o applicando `operator-crds.yaml` dopo
+`tigera-operator.yaml` che le include già, si ottiene una lunga lista di errori
+`AlreadyExists`.
+
+Significano "questa cosa c'è già". `create` si rifiuta di sovrascrivere — ed è la
+protezione che evita danni. Leggere il **tipo** di errore prima di allarmarsi.
+
+---
+
 # Anatomia dei comandi
 
 Sezione di riferimento per i costrutti bash usati sopra.
@@ -781,6 +1071,13 @@ significato di un comando.
 - [x] Fase 4 — `kubeadm init`
 - [x] Fase 5 — Calico v3.32.1
 - [x] Fase 6 — join dei worker
-- [ ] Fase 7 — storage local-path
-- [ ] Fase 8 — l'applicazione
-- [ ] Fase 9 — confronto con k3s
+- [x] Fase 7 — storage local-path v0.0.37
+- [x] Fase 8 — l'applicazione (stessi manifest di k3s)
+- [x] Fase 9 — confronto con k3s → `../confronto-k3s-kubeadm.md`
+
+## Da correggere
+
+- [ ] `host-setup.sh`: `enable --now` → `enable` + `restart`
+- [ ] `initContainer` che attende MySQL, invece del Job che fallisce e ritenta
+- [ ] Sonde `readiness`/`liveness` (l'app non ha `/health`)
+- [ ] NetworkPolicy: con Calico funzionano davvero, a differenza di k3s

@@ -341,21 +341,32 @@ Il riassunto affidabile è `tigerastatus`, non i log.
 
 ---
 
-## 9. Le NetworkPolicy
+## 9. L'incapsulamento — e un buco nel firewall
 
-```bash
-kubectl --context k3s get pods -n kube-system -o wide | grep -i flannel
-```
+| | k3s (Flannel) | kubeadm (Calico) |
+|---|---|---|
+| Incapsulamento | **VXLAN sempre** | `VXLANCrossSubnet`: solo tra sottoreti diverse |
+| Tra nodi della stessa sottorete | incapsulato | **routing diretto** |
 
-k3s usa **Flannel**, che **non applica** le NetworkPolicy: si possono scrivere,
-vengono accettate dall'API server, e non hanno alcun effetto. Un falso senso di
-sicurezza.
+Con i sei nodi tutti su `192.168.150.0/24`, la differenza è concreta: su k3s i
+pacchetti tra pod viaggiano travestiti da `192.168.150.x`; su kubeadm restano
+`10.244.x.x` in chiaro.
 
-Calico invece le applica. È uno dei motivi per cui è stato scelto qui.
+**Conseguenza reale in questo lab:** le regole `iptables` sull'host autorizzavano
+solo `192.168.150.0/24`. Su k3s funzionava perché i pacchetti erano incapsulati;
+su kubeadm la rete tra nodi era completamente bloccata.
+
+La configurazione più efficiente ha rivelato un difetto che l'altra mascherava.
+Dettagli in `kubeadm/README.md`, trappola 1.
+
+## 9-bis. Le NetworkPolicy
+
+**Flannel non le applica.** Si possono scrivere, l'API server le accetta, e non
+hanno alcun effetto: un falso senso di sicurezza.
+
+**Calico le applica davvero.** È uno dei motivi della scelta.
 
 *(Da verificare con un test pratico quando le scriveremo.)*
-
----
 
 ## 10. Reti a confronto
 
@@ -415,8 +426,8 @@ specifica.
 
 # Da completare
 
-- [ ] Sezione 6 — output reale di `kube-system` sui due cluster
 - [ ] Sezione 7 — output reale delle taint
+- [ ] Confronto dei tempi: k3s ~1 min, kubeadm ~3 ore incluse le trappole
 - [ ] Sezione 9 — test pratico di una NetworkPolicy su Calico
 - [ ] Confronto del consumo di risorse (`kubectl top nodes`) a parità di carico
 - [ ] Tempi di avvio a freddo dei due cluster
