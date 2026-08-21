@@ -24,6 +24,8 @@ installato a mano, e i **manifest di `manifests/` applicati identici**.
 
 Ogni riga della colonna destra è una cosa che prima era invisibile.
 
+
+
 ---
 
 ## Fase 1 — Prerequisiti sui tre nodi
